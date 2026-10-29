@@ -207,7 +207,19 @@ jobs:
             "" \
             "---" \
             "_此 issue 由 sync-upstream workflow 自动创建_")
-          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" || true
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" 2>/dev/null \
+            || echo "::warning::无法创建 issue —— 该仓库未启用 Issues 功能。详情见本 job 日志与下方 Summary。"
+          {
+            echo "## ⚠️ 上游合并后校验未通过，已阻止推送"
+            echo ""
+            echo "| 校验项 | 结果 |"
+            echo "|---|---|"
+            echo "| DNS 防泄露完好 | \`${{ steps.verify.outputs.dns_ok }}\` |"
+            echo "| 测试退出码 | \`${{ steps.test.outputs.test_exit }}\` |"
+            echo "| 上游 HEAD | \`${{ steps.fetch.outputs.upstream }}\` |"
+            echo ""
+            echo "常见原因：上游改动了 \`defaultDNS\` / \`proxyServerDNS\`，把加密 DNS 换回了明文。"
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 1
 
       - name: Open issue on conflict
@@ -217,33 +229,57 @@ jobs:
         run: |
           TITLE="⚠️ 上游更新合并冲突，需要手动处理"
           # 已存在同类 issue 就不重复开
-          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE" --json number -q '.[0].number' || true)
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE" --json number -q '.[0].number' 2>/dev/null || true)
+          BODY=$(printf '%s\n' \
+            "上游有新提交，但自动合并失败（冲突文件见 Actions 日志）。" \
+            "" \
+            "**手动处理步骤：**" \
+            "" \
+            '```bash' \
+            "git pull" \
+            "git remote add upstream https://github.com/fanren-pxx/MyClash.git  # 如已有可跳过" \
+            "git fetch upstream" \
+            "git merge upstream/fake-upstream" \
+            "# 解决冲突（通常在 Script/mihomoScript.js 的 defaultDNS / proxyServerDNS 两个常量）" \
+            "# ⚠️ 解决时保留 DNS 修复：defaultDNS 必须仍是 tls://...#SNI 形式，不能回到 114" \
+            "node Test/run-tests.js   # 211 项全绿再推" \
+            "git push" \
+            '```' \
+            "" \
+            "上游提交：${{ steps.fetch.outputs.upstream }}" \
+            "" \
+            "---" \
+            "_此 issue 由 sync-upstream workflow 自动创建，处理完可关闭_")
+          # Issues 可能没在仓库里启用，失败不能让通知整条链路断掉
           if [ -n "$EXISTING" ]; then
             echo "已有 issue #$EXISTING，追加评论"
-            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "自动同步于 $(date -u) 再次冲突，上游 HEAD: ${{ steps.fetch.outputs.upstream }}"
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY" 2>/dev/null \
+              || echo "::warning::追加评论失败（可能是 Issues 未开启）"
           else
-            BODY=$(printf '%s\n' \
-              "上游 \`AIsouler/MyClash\` 有新提交，但自动合并失败（冲突文件见 Actions 日志）。" \
-              "" \
-              "**手动处理步骤：**" \
-              "" \
-              '```bash' \
-              "git pull" \
-              "git remote add upstream https://github.com/fanren-pxx/MyClash.git  # 如已有可跳过" \
-              "git fetch upstream" \
-              "git merge upstream/fake-upstream" \
-              "# 解决冲突（通常在 Script/mihomoScript.js 的 defaultDNS / proxyServerDNS 两个常量）" \
-              "# ⚠️ 解决时保留 DNS 修复：defaultDNS 必须仍是 tls://...#SNI 形式，不能回到 114" \
-              "node Test/run-tests.js   # 211 项全绿再推" \
-              "git push" \
-              '```' \
-              "" \
-              "上游提交：${{ steps.fetch.outputs.upstream }}" \
-              "" \
-              "---" \
-              "_此 issue 由 sync-upstream workflow 自动创建，处理完可关闭_")
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" 2>/dev/null \
+              || echo "::warning::无法创建 issue —— 该仓库未启用 Issues 功能。冲突详情见本 job 日志与下方 Summary。"
           fi
+          # 兜底：把冲突信息写进 Summary，即使 issue 开不出来也一定能看到
+          {
+            echo "## ⚠️ 上游合并冲突，未推送"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 HEAD | \`${{ steps.fetch.outputs.upstream }}\` |"
+            echo "| 冲突文件 | \`Script/mihomoScript.js\` |"
+            echo ""
+            echo '```bash'
+            echo "git pull"
+            echo "git remote add upstream https://github.com/fanren-pxx/MyClash.git"
+            echo "git fetch upstream"
+            echo "git merge upstream/fake-upstream"
+            echo "# 保留 DNS 修复后提交"
+            echo "node Test/run-tests.js"
+            echo "git push"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 让 job 失败：Actions 会给仓库所有者发邮件，不会静默
+          exit 1
 
       - name: Summary
         run: |

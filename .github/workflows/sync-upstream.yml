@@ -101,39 +101,114 @@ jobs:
         id: verify
         if: steps.merge.outputs.conflict == 'false' && steps.fetch.outputs.up_to_date == 'false'
         run: |
-          set +e
-          # 上游可能改了 DNS 常量，这里做一次硬校验，防止修复被静默覆盖
+          # 上游可能改了 DNS 常量，这里做一次硬校验，防止修复被静默覆盖。
+          # 分两层：静态检查（常量和函数还在）+ 行为验证（真正跑一次 main() 看输出）
           FAIL=0
-          # defaultDNS / proxyServerDNS 不能再出现明文 114
-          if grep -E "^const (defaultDNS|proxyServerDNS) *=" Script/mihomoScript.js | grep -q "114.114"; then
-            echo "❌ defaultDNS / proxyServerDNS 里又出现了明文 114"; FAIL=1
+          SRC=Script/mihomoScript.js
+
+          # 1. bootstrap 常量不能再出现明文 114
+          if grep -E "^const (defaultDNS|proxyServerDNS) *=" "$SRC" | grep -q "114.114"; then
+            echo "❌ defaultDNS / proxyServerDNS 里又出现了明文 114"
+            FAIL=1
           fi
-          grep -q "dns.alidns.com" Script/mihomoScript.js || { echo "❌ 找不到 DoT bootstrap"; FAIL=1; }
-          grep -q "isPlainDns" Script/mihomoScript.js || { echo "❌ 找不到 isPlainDns 防护"; FAIL=1; }
+
+          # 2. DoT bootstrap 还在
+          grep -q "dns.alidns.com" "$SRC" || { echo "❌ 找不到 DoT bootstrap"; FAIL=1; }
+
+          # 3. isPlainDns 必须是"函数定义"，只命中调用处不算（防止函数被删、调用残留）
+          grep -q "function isPlainDns" "$SRC" || { echo "❌ isPlainDns 函数定义丢失"; FAIL=1; }
+
+          # 4. 行为验证：喂一个明文 DNS 给节点域名策略，输出里必须被换成加密 DoT。
+          #    这是唯一能证明"防护逻辑真的生效"的检查，静态 grep 做不到。
+          if [ "$FAIL" -eq 0 ]; then
+            node -e '
+              const { loadScript } = require("./Test/lib/loader");
+              const api = loadScript("Script/mihomoScript.js");
+              const cfg = {
+                proxies: [{ name: "HK 01", type: "ss", server: "n1.verify.test", port: 443, cipher: "aes-128-gcm", password: "x" }],
+                dns: { "proxy-server-nameserver-policy": { "n1.verify.test": ["114.114.114.114#DIRECT", "system"] } },
+              };
+              const out = api.main(cfg).dns["proxy-server-nameserver-policy"]["n1.verify.test"];
+              const ok = Array.isArray(out) && out.length > 0 && out.every((d) => /^(tls|https|h3|quic):\/\//.test(d));
+              if (!ok) {
+                console.error("❌ 行为验证失败：明文 DNS 没有被剔除/兜底，实际输出 =", JSON.stringify(out));
+                process.exit(1);
+              }
+              console.log("✅ 行为验证通过：明文 DNS 已替换为", out[0]);
+            ' || { echo "❌ 行为验证未通过"; FAIL=1; }
+          fi
+
           if [ "$FAIL" -eq 1 ]; then
             echo "dns_ok=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "dns_ok=true" >> "$GITHUB_OUTPUT"
-            echo "✅ DNS 防泄露改动完好"
+            exit 1
           fi
+          echo "dns_ok=true" >> "$GITHUB_OUTPUT"
+          echo "✅ DNS 防泄露改动完好（静态 + 行为验证均通过）"
 
       - name: Run tests
         id: test
-        if: steps.merge.outputs.conflict == 'false' && steps.fetch.outputs.up_to_date == 'false'
+        # 校验失败就不用跑测试了，直接让 job 失败
+        if: |
+          steps.merge.outputs.conflict == 'false' &&
+          steps.fetch.outputs.up_to_date == 'false' &&
+          steps.verify.outputs.dns_ok == 'true'
         run: |
-          set +e
           npm --prefix Test install --no-audit --no-fund
           node Test/run-tests.js
           echo "test_exit=$?" >> "$GITHUB_OUTPUT"
 
       - name: Push
+        # 只有「无冲突 + DNS 校验通过 + 测试通过」才推送，任何一项失败都不落地
         if: |
           steps.merge.outputs.conflict == 'false' &&
           steps.fetch.outputs.up_to_date == 'false' &&
+          steps.verify.outputs.dns_ok == 'true' &&
+          steps.test.outputs.test_exit == '0' &&
           inputs.dry_run != 'true'
         run: |
           git push origin HEAD:main
           echo "✅ 已推送到 main"
+
+      - name: Open issue on verification failure
+        # 合并成功但 DNS 校验或测试没通过：不推送，开 issue 提醒。
+        # 注意 Push 的 if 是"必须都成功"，这里用 always() + 反向条件，保证失败时也会执行
+        if: |
+          always() &&
+          steps.merge.outputs.conflict == 'false' &&
+          steps.fetch.outputs.up_to_date == 'false' &&
+          (steps.verify.outputs.dns_ok != 'true' || steps.test.outputs.test_exit != '0')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="⚠️ 上游合并后校验未通过，已阻止推送"
+          BODY=$(printf '%s\n' \
+            "上游有新提交，自动合并成功，但**合并结果没通过校验，因此没有推送到 main**。" \
+            "" \
+            "| 校验项 | 结果 |" \
+            "|---|---|" \
+            "| DNS 防泄露完好 | \`${{ steps.verify.outputs.dns_ok }}\` |" \
+            "| 测试退出码 | \`${{ steps.test.outputs.test_exit }}\` |" \
+            "" \
+            "**常见原因**：上游改动了 \`Script/mihomoScript.js\` 的 \`defaultDNS\` / \`proxyServerDNS\`，把加密 DNS 换回了明文（如 114）。" \
+            "" \
+            "**处理步骤：**" \
+            "" \
+            '```bash' \
+            "git pull" \
+            "git remote add upstream https://github.com/AIsouler/MyClash.git  # 如已有可跳过" \
+            "git fetch upstream" \
+            "git merge upstream/main" \
+            "# 手动修正：defaultDNS / proxyServerDNS 必须保持 tls://IP#SNI 形式，不能出现 114 等明文 DNS" \
+            "node Test/run-tests.js   # 211 项全绿再推" \
+            "git push" \
+            '```' \
+            "" \
+            "上游提交：${{ steps.fetch.outputs.upstream }}" \
+            "" \
+            "---" \
+            "_此 issue 由 sync-upstream workflow 自动创建_")
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" || true
+          exit 1
 
       - name: Open issue on conflict
         if: steps.merge.outputs.conflict == 'true'

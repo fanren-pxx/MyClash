@@ -30,6 +30,10 @@ const EXPORT_SUFFIX = `
 // 仅全量版存在 buildCustomizeGroups，精简版无此函数时保持导出不报错
 if (typeof buildCustomizeGroups !== 'undefined') {
   module.exports.buildCustomizeGroups = buildCustomizeGroups;
+}
+// 仅全量版存在明文 DNS 判定（精简版沿用原 DNS 策略）
+if (typeof isPlainDns !== 'undefined') {
+  module.exports.isPlainDns = isPlainDns;
 }`;
 
 /**

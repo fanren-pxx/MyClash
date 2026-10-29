@@ -22,6 +22,11 @@ function withOptions(api, patch, fn) {
  * meta: { full, regions }
  */
 function runIntegrationTests(h, api, meta, fx, loadScript, scriptFile) {
+  // 全量版独有的防泄露 DNS 策略用例（精简版 Script.js 无 isPlainDns 与 DoT bootstrap）
+  const fullOnly = (name, fn) => {
+    if (meta.full) h.test(name, fn);
+  };
+
   // ---------------- 节点过滤与标准化 ----------------
   h.section('集成测试 · 节点过滤与标准化');
   h.test('节点过滤与标准化：剔除无效节点、保留有效节点并补国旗', () => {
@@ -124,10 +129,15 @@ function runIntegrationTests(h, api, meta, fx, loadScript, scriptFile) {
     ]);
     h.assert(!('hk1.example.com' in policy), '压缩后不应保留冗余的精确子域规则');
     // 公共 DNS 不进入 policy；私有 DNS 不应含 # 后缀
-    const policyText = JSON.stringify(policy);
+    const policyText = JSON.stringify(policy['+.example.com']);
     h.assert(!policyText.includes('8.8.8.8'), 'nameserver 公共 DNS 应被过滤');
     h.assert(!policyText.includes('223.5.5.5'), 'proxy-server-nameserver 公共 DNS 应被过滤');
     h.assert(!policyText.includes('#'), '私有 DNS 不应含 # 后缀');
+    // 全量版：policy 中每个值都必须是加密 DNS（私有 DNS 或兜底 DoT），不得出现明文 114 / 裸 IP
+    if (!meta.full) return;
+    const allPolicyText = JSON.stringify(policy);
+    h.assert(!allPolicyText.includes('114.114'), '不应对节点域名使用 114 明文 DNS');
+    h.assert(!allPolicyText.includes('"8.8.8.8"'), '不应对节点域名使用 8.8.8.8 明文 DNS');
   });
   h.test('私有 DNS 后缀处理：非 direct 剥离、direct/直连 规范化为 #DIRECT', () => {
     // 无节点专属 DNS 策略时，私有 DNS 经 policy 生效，后缀规则随之生效
@@ -164,15 +174,15 @@ function runIntegrationTests(h, api, meta, fx, loadScript, scriptFile) {
     };
     const out = api.main(cfg);
     // 存在节点专属 DNS 策略时优先保留（# 后缀被剥离），不生成私有 DNS 兜底；
-    // hk1.example.com 被 hosts 映射为 IP（10.0.0.1）后不再匹配节点域名 → 被排除
-    h.assertDeep(out.dns['proxy-server-nameserver-policy'], {
-      // 来自 proxy-server-nameserver-policy（hk1.example.com 映射为 IP 被排除）
-      '+.example.com': ['https://other-dns.com/dns-query'],
-      // 来自 nameserver-policy（#PROXY 后缀被剥离）
-      'jp1.example.com': 'https://private-ns.example-dns.com/dns-query',
-    });
+    // hk1.example.com 被 hosts 映射为 IP（10.0.0.1）后不再匹配节点域名 → 被排除；
+    // 未被专属策略覆盖的节点域名兜底写入内置 DoT
+    const policy = out.dns['proxy-server-nameserver-policy'];
+    h.assertDeep(policy['+.example.com'], ['https://other-dns.com/dns-query']);
+    h.assertDeep(policy['jp1.example.com'], 'https://private-ns.example-dns.com/dns-query');
+    h.assert(!('hk1.example.com' in policy), '映射为 IP 的节点域名不应进入 policy');
+    if (meta.full) h.assertDeep(policy['hk3.example.com'], api.proxyServerDNS);
   });
-  h.test('仅匹配部分节点域名时不压缩策略，避免后缀规则扩大匹配范围', () => {
+  fullOnly('仅匹配部分节点域名时不压缩策略，避免后缀规则扩大匹配范围', () => {
     const cfg = fx.minimalSubscription();
     cfg.dns = {
       'proxy-server-nameserver-policy': {
@@ -181,10 +191,13 @@ function runIntegrationTests(h, api, meta, fx, loadScript, scriptFile) {
       },
     };
     const out = api.main(cfg);
-    h.assertDeep(out.dns['proxy-server-nameserver-policy'], {
-      'b.example.com': ['https://private.example-dns.com/dns-query'],
-      'a.example.com': ['https://private.example-dns.com/dns-query'],
-    });
+    const policy = out.dns['proxy-server-nameserver-policy'];
+    h.assertDeep(policy['b.example.com'], ['https://private.example-dns.com/dns-query']);
+    h.assertDeep(policy['a.example.com'], ['https://private.example-dns.com/dns-query']);
+    // a/b 已有加密 DNS，其余节点域名改用内置 DoT 兜底
+    const others = Object.keys(policy).filter((d) => !['a.example.com', 'b.example.com'].includes(d));
+    h.assert(others.length > 0, '其余节点域名也应写入 policy');
+    for (const d of others) h.assertDeep(policy[d], api.proxyServerDNS);
   });
   h.test('策略域名与节点域名完整一致时按忽略顺序的集合比较后压缩', () => {
     const cfg = fx.minimalSubscription();
@@ -288,13 +301,83 @@ function runIntegrationTests(h, api, meta, fx, loadScript, scriptFile) {
     delete cfg.hosts;
     const out = api.main(cfg);
     h.assertEqual(out.dns.enable, true);
-    // 默认与代理服务器 DNS 使用各自的固定公共 DNS；无私有 DNS 时不生成 policy
+    // 默认与代理服务器 DNS 使用各自的固定公共 DNS；无私有 DNS 时节点域名 policy 全部兜底为内置 DoT
     h.assertDeep(out.dns['default-nameserver'], api.defaultDNS);
     h.assertDeep(out.dns['proxy-server-nameserver'], api.proxyServerDNS);
-    h.assert(!('proxy-server-nameserver-policy' in out.dns), '无私有 DNS 时不应生成 policy');
+    if (!meta.full) h.assert(!('proxy-server-nameserver-policy' in out.dns), '无私有 DNS 时不应生成 policy');
+    // 全量版：节点域名 policy 全部兜底为内置 DoT
+    if (meta.full) {
+      const policy = out.dns['proxy-server-nameserver-policy'];
+      h.assert(Object.keys(policy).length > 0, '节点域名应生成 policy');
+      for (const value of Object.values(policy)) h.assertDeep(value, api.proxyServerDNS);
+    }
     h.assertDeep(out.hosts['doh.pub'], ['1.12.12.12', '120.53.53.53']);
     // 默认 hosts 仍生成（不再包含已移除的 dns.alidns.com/dns.google 等条目）
     h.assertDeep(out.hosts['services.googleapis.cn'], 'services.googleapis.com');
+  });
+  fullOnly('明文 DNS 判定：114 / 裸 IP / system / 无 SNI 的 IP DoT 均视为明文', () => {
+    for (const dns of [
+      '114.114.114.114',
+      '114.114.114.114#DIRECT',
+      '8.8.8.8',
+      'udp://1.2.3.4:53',
+      'tcp://223.5.5.5',
+      'system',
+      'tls://223.5.5.5',
+      'tls://223.5.5.5#',
+      'https://1.12.12.12/dns-query',
+      'https://dns.alidns.com/dns-query?insecure=true',
+    ]) {
+      h.assert(api.isPlainDns(dns), `${dns} 应判为明文 DNS`);
+    }
+    for (const dns of [
+      'tls://223.5.5.5#dns.alidns.com',
+      'tls://1.12.12.12#dot.pub',
+      'https://dns.alidns.com/dns-query',
+      'https://doh.pub/dns-query#DIRECT',
+      'https://dns.alidns.com/dns-query#dns.alidns.com',
+    ]) {
+      h.assert(!api.isPlainDns(dns), `${dns} 不应判为明文 DNS`);
+    }
+  });
+  fullOnly('bootstrap DNS 固定为 IP 直连 DoT（带 SNI），不出现明文 UDP 53', () => {
+    const out = api.main(fx.typicalSubscription());
+    for (const dns of [...out.dns['default-nameserver'], ...out.dns['proxy-server-nameserver']]) {
+      h.assert(dns.startsWith('tls://'), `${dns} 应为 DoT`);
+      h.assert(/#/.test(dns), `${dns} 应带 SNI 以通过证书校验`);
+      h.assert(!api.isPlainDns(dns), `${dns} 不应为明文 DNS`);
+    }
+    h.assert(!JSON.stringify(out.dns).includes('114.114'), '输出配置中不应出现 114 明文 DNS');
+  });
+  fullOnly('订阅给节点域名写的明文 DNS 被剔除，无加密 DNS 时兜底内置 DoT', () => {
+    const cfg = fx.minimalSubscription();
+    cfg.dns = {
+      'proxy-server-nameserver-policy': {
+        'a.example.com': ['114.114.114.114', 'tls://1.12.12.12#dot.pub'],
+        'b.example.com': ['114.114.114.114'],
+        'c.example.com': 'system',
+      },
+    };
+    const out = api.main(cfg);
+    // a/b/c/d 四个节点：仅 a 有加密 DNS 残留，其余（含不含加密 DNS 的 b/c）全部兜底内置 DoT，
+    // 加密 DNS 全部一致时可压缩为后缀规则
+    const policy = out.dns['proxy-server-nameserver-policy'];
+    h.assert(
+      !('a.example.com' in policy) || JSON.stringify(policy['a.example.com']) === JSON.stringify(api.proxyServerDNS),
+    );
+    h.assertDeep(policy['+.example.com'], api.proxyServerDNS);
+    const text = JSON.stringify(policy);
+    h.assert(!text.includes('114.114'), 'policy 中不应出现 114');
+    h.assert(!text.includes('system'), 'policy 中不应出现 system');
+  });
+  fullOnly('订阅 nameserver 中的明文 DNS 不进入节点域名 policy', () => {
+    const cfg = fx.typicalSubscription();
+    delete cfg.dns.listen;
+    delete cfg.dns['proxy-server-nameserver-policy'];
+    cfg.dns['nameserver'] = ['114.114.114.114', '8.8.8.8', 'https://private.example-dns.com/dns-query'];
+    const out = api.main(cfg);
+    const policy = out.dns['proxy-server-nameserver-policy'];
+    h.assertDeep(policy['+.example.com'], ['https://private.example-dns.com/dns-query']);
   });
 
   // ---------------- 配置选项切换 ----------------

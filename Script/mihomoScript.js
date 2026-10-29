@@ -1382,10 +1382,20 @@ const commonDnsRegex = new RegExp(
 );
 
 // 国内外 DNS 定义
+// 注意：default-nameserver / proxy-server-nameserver 用来 bootstrap DNS 服务器自身、并解析节点域名，
+// 其中的明文 UDP 53 解析结果会被运营商看到并劫持（节点域名 => 泄露给运营商，且可被投毒到劫持 IP），
+// 故两处一律不使用明文 UDP 53 的国内明文 DNS（如 114.114.114.114），只保留 IP 可直连的 DoT / DoH，
+// 保证在大部分环境下（无法直连境外、无本地 DNS 服务）仍可完成 bootstrap，同时不泄露解析域名。
+//
+// 写法说明（mihomo 解析 "tls://IP#SNI" 语法）：
+//   223.5.5.5 的 DoT 证书是 *.alidns.com，裸写 tls://223.5.5.5 在证书校验分支下会失败；
+//   dot.pub / doh.pub 证书是 *.doh.pub，裸写 IP 同理。故一律使用 tls://IP#SNI 固定证书名，
+//   既能直连 IP 免去二次解析（不再有明文 UDP 53 引导环节），又能通过证书校验。
 const chinaDNS = ['223.5.5.5#DIRECT', '119.29.29.29#DIRECT'];
 const foreignDNS = ['https://cloudflare-dns.com/dns-query#默认代理', 'https://dns.google/dns-query#默认代理'];
-const defaultDNS = ['114.114.114.114#DIRECT', 'tls://223.5.5.5#DIRECT', 'https://1.12.12.12/dns-query#DIRECT'];
-const proxyServerDNS = ['114.114.114.114#DIRECT', 'tls://223.5.5.5#DIRECT', 'https://doh.pub/dns-query#DIRECT'];
+// bootstrap：阿里 DoT + 腾讯 DoT，全部走 TLS，无一处明文 UDP 53
+const defaultDNS = ['tls://223.5.5.5#dns.alidns.com', 'tls://1.12.12.12#dot.pub', 'tls://120.53.53.53#dot.pub'];
+const proxyServerDNS = ['tls://223.5.5.5#dns.alidns.com', 'tls://1.12.12.12#dot.pub', 'tls://120.53.53.53#dot.pub'];
 
 /**
  * hosts 匹配优先级：精确 > +. > . > *（同级按出现顺序）
@@ -1511,6 +1521,37 @@ function isIpAddress(server) {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(server) || server.includes(':');
 }
 
+// 明文 UDP / TCP 53 的 DNS 写法（如 114.114.114.114、udp://1.2.3.4:53）
+const plainDnsRegex = /^(?:(?:udp|tcp):\/\/)?\[?[0-9a-fA-F:.]+\]?(?::\d+)?(?:\/[^#]*)?$/;
+
+/**
+ * 判断 DNS 条目是否以明文（非 TLS/DoH）方式发出查询，明文结果可被运营商看到并劫持：
+ * 1. 非 TLS / HTTPS / QUIC 协议的条目（system、udp://、tcp://、裸 IP、裸域名）均为明文
+ * 2. 协议为 TLS / HTTPS / QUIC 但缺少本机可校验凭据（IP 直连的 DoT/DoH 未带 #SNI，或带 &insecure=true）时，
+ *    证书校验被放宽，仍可能被中间人看到域名
+ * 本配置的地域分流只依赖加密 DNS，凡判断为明文的条目统一剔除
+ */
+function isPlainDns(dns) {
+  const raw = String(dns).trim();
+  const value = raw.toLowerCase().split('#')[0];
+
+  if (value === 'system' || value === 'system://') return true;
+
+  const match = value.match(/^([a-z][a-z0-9+.-]*):\/\//);
+  if (!match) return plainDnsRegex.test(value);
+
+  const protocol = match[1];
+  if (!['tls', 'https', 'h3', 'quic'].includes(protocol)) return true;
+
+  if (/[?&]insecure=(true|1)\b/.test(value)) return true;
+
+  const host = value.slice(match[0].length).split('/')[0].replace(/:\d+$/, '');
+  if (!isIpAddress(host)) return false;
+
+  // IP 直连的 DoT / DoH：必须带 #SNI 才能通过证书校验，否则视为不安全
+  return raw.split('#').length < 2 || raw.split('#')[1].trim() === '';
+}
+
 /**
  * 简化节点域名策略：将相同 DNS 的节点域名按后缀归类，至少三段的域名可合并为 +. 后缀形式
  */
@@ -1564,6 +1605,9 @@ function simplifyDomainPolicy(policy) {
  * hosts改写条件（满足任意一个条件即可）：
  * 1. proxy-server-nameserver 有且仅有一个 DNS 并且该 DNS 包含非空的 listen 值
  * 2. proxy-server-nameserver 有且仅有一个 DNS 并且该 DNS 包含 127.0.0.1 并且 listen 包含 0.0.0.0
+ * 防泄露：default-nameserver / proxy-server-nameserver 固定为 IP 直连 DoT（带 #SNI），
+ * 节点域名 policy 中的明文 DNS（114 / 订阅自带的裸 IP / system）一律剔除，
+ * 无加密 DNS 可用时改用内置 DoT，保证节点域名解析不落到运营商明文 DNS 上
  */
 function buildDnsAndHostsConfig(config, filteredProxies) {
   const minimalModeEnabled = ruleOptionsEnable.极简模式;
@@ -1599,11 +1643,14 @@ function buildDnsAndHostsConfig(config, filteredProxies) {
     return commonDnsRegex.test(value);
   };
 
+  // 安全 DNS 过滤：节点域名解析走加密通道；明文 DNS 会被运营商看到/劫持，全部剔除
+  const keepSecureDns = (dns) => dns.length > 0 && !isPlainDns(dns);
+
   const privateDNS = [
     ...new Set(
       [...(originalDnsConfig['nameserver'] || []), ...privateProxyServerNameservers]
         .map(stripDnsSuffix)
-        .filter((dns) => dns.length > 0 && !isCommonDns(dns)),
+        .filter((dns) => dns.length > 0 && !isCommonDns(dns) && keepSecureDns(dns)),
     ),
   ];
 
@@ -1614,8 +1661,13 @@ function buildDnsAndHostsConfig(config, filteredProxies) {
   })) {
     if (!matchDomainPattern(domain, proxyDomains)) continue;
 
-    const stripedDns = Array.isArray(dns) ? dns.map(stripDnsSuffix).filter((d) => d.length > 0) : stripDnsSuffix(dns);
+    // 订阅里给节点域名写的明文 DNS 不能保留，只留加密 DNS
+    const stripedDns = Array.isArray(dns) ? dns.map(stripDnsSuffix).filter(keepSecureDns) : stripDnsSuffix(dns);
     if (Array.isArray(stripedDns) && stripedDns.length === 0) continue;
+
+    // 单条规则只给了一个明文 DNS（如 '114.114.114.114'，剥离后成了空串）时，只丢弃该域名规则，
+    // 交给兜底写入内置 DoT；若把空串当作通配规则保留，后面的兜底就不可能生效
+    if (!Array.isArray(stripedDns) && !keepSecureDns(stripedDns)) continue;
 
     matchedProxyPolicy[domain] = stripedDns;
   }
@@ -1624,6 +1676,12 @@ function buildDnsAndHostsConfig(config, filteredProxies) {
     for (const domain of proxyDomains) {
       matchedProxyPolicy[domain] = privateDNS;
     }
+  }
+
+  // 兜底：节点域名没有可用的加密 DNS（订阅只给了明文 114/system，或压根没给）时，
+  // 显式写入内置 DoT，避免节点域名解析回落到 default-nameserver 之外的明文通道
+  for (const domain of proxyDomains) {
+    if (!(domain in matchedProxyPolicy)) matchedProxyPolicy[domain] = proxyServerDNS;
   }
 
   const matchedPolicyDomains = Object.keys(matchedProxyPolicy);

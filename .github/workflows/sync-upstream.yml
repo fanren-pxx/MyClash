@@ -1,0 +1,187 @@
+name: Sync from upstream
+
+# 自动跟踪 AIsouler/MyClash 上游更新，并把 DNS 防泄露改动保留在上面
+#
+# 触发方式：
+#   1. 每天 04:17 (UTC+8) 自动检查一次
+#   2. 仓库 Actions 页面点 "Run workflow" 手动触发
+#
+# 行为：
+#   - 快进合并（fast-forward）优先，不产生多余提交
+#   - 上游改了冲突文件时，自动合并失败 → 开一个 issue 提醒你手动解决
+#   - 合并成功后自动推送，raw 链接立即生效
+
+on:
+  schedule:
+    # cron 是 UTC。04:17 UTC+8 == 20:17 UTC
+    - cron: '17 20 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '只检查不推送（dry run）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream/main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 用默认 GITHUB_TOKEN 即可，无需额外 secret
+          persist-credentials: true
+
+      - name: Show current state
+        run: |
+          echo "当前 HEAD: $(git rev-parse --short HEAD) $(git log -1 --format=%s)"
+          echo "远程分支:"
+          git branch -r
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/AIsouler/MyClash.git || \
+            git remote set-url upstream https://github.com/AIsouler/MyClash.git
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          git fetch upstream main --depth=50
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "upstream=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$UPSTREAM_SHA" "$HEAD_SHA"; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "✅ 已是最新，无需同步"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "⬆️ 上游有新提交，开始合并"
+            git log --oneline "$HEAD_SHA".."$UPSTREAM_SHA"
+          fi
+
+      - name: Merge upstream
+        id: merge
+        if: steps.fetch.outputs.up_to_date == 'false'
+        run: |
+          set +e
+          # 先尝试 fast-forward（你没有任何本地提交时走这条路，最干净）
+          git merge --ff-only upstream/main
+          FF_EXIT=$?
+          if [ "$FF_EXIT" -ne 0 ]; then
+            echo "无法快进，改用普通合并（保留本地 DNS 修复提交）"
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git merge --no-edit upstream/main
+            MERGE_EXIT=$?
+            if [ "$MERGE_EXIT" -ne 0 ]; then
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              git diff --name-only --diff-filter=U || true
+              exit 0
+            fi
+          fi
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          echo "merged_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify DNS fix is still intact
+        id: verify
+        if: steps.merge.outputs.conflict == 'false' && steps.fetch.outputs.up_to_date == 'false'
+        run: |
+          set +e
+          # 上游可能改了 DNS 常量，这里做一次硬校验，防止修复被静默覆盖
+          FAIL=0
+          # defaultDNS / proxyServerDNS 不能再出现明文 114
+          if grep -E "^const (defaultDNS|proxyServerDNS) *=" Script/mihomoScript.js | grep -q "114.114"; then
+            echo "❌ defaultDNS / proxyServerDNS 里又出现了明文 114"; FAIL=1
+          fi
+          grep -q "dns.alidns.com" Script/mihomoScript.js || { echo "❌ 找不到 DoT bootstrap"; FAIL=1; }
+          grep -q "isPlainDns" Script/mihomoScript.js || { echo "❌ 找不到 isPlainDns 防护"; FAIL=1; }
+          if [ "$FAIL" -eq 1 ]; then
+            echo "dns_ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dns_ok=true" >> "$GITHUB_OUTPUT"
+            echo "✅ DNS 防泄露改动完好"
+          fi
+
+      - name: Run tests
+        id: test
+        if: steps.merge.outputs.conflict == 'false' && steps.fetch.outputs.up_to_date == 'false'
+        run: |
+          set +e
+          npm --prefix Test install --no-audit --no-fund
+          node Test/run-tests.js
+          echo "test_exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Push
+        if: |
+          steps.merge.outputs.conflict == 'false' &&
+          steps.fetch.outputs.up_to_date == 'false' &&
+          inputs.dry_run != 'true'
+        run: |
+          git push origin HEAD:main
+          echo "✅ 已推送到 main"
+
+      - name: Open issue on conflict
+        if: steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="⚠️ 上游更新合并冲突，需要手动处理"
+          # 已存在同类 issue 就不重复开
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE" --json number -q '.[0].number' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "已有 issue #$EXISTING，追加评论"
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "自动同步于 $(date -u) 再次冲突，上游 HEAD: ${{ steps.fetch.outputs.upstream }}"
+          else
+            BODY=$(printf '%s\n' \
+              "上游 \`AIsouler/MyClash\` 有新提交，但自动合并失败（冲突文件见 Actions 日志）。" \
+              "" \
+              "**手动处理步骤：**" \
+              "" \
+              '```bash' \
+              "git pull" \
+              "git remote add upstream https://github.com/AIsouler/MyClash.git  # 如已有可跳过" \
+              "git fetch upstream" \
+              "git merge upstream/main" \
+              "# 解决冲突（通常在 Script/mihomoScript.js 的 defaultDNS / proxyServerDNS 两个常量）" \
+              "# ⚠️ 解决时保留 DNS 修复：defaultDNS 必须仍是 tls://...#SNI 形式，不能回到 114" \
+              "node Test/run-tests.js   # 211 项全绿再推" \
+              "git push" \
+              '```' \
+              "" \
+              "上游提交：${{ steps.fetch.outputs.upstream }}" \
+              "" \
+              "---" \
+              "_此 issue 由 sync-upstream workflow 自动创建，处理完可关闭_")
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 HEAD | \`${{ steps.fetch.outputs.upstream }}\` |"
+            echo "| 合并前 HEAD | \`${{ steps.fetch.outputs.head }}\` |"
+            echo "| 是否有更新 | \`${{ steps.fetch.outputs.up_to_date == 'true' && '无' || '有' }}\` |"
+            echo "| 冲突 | \`${{ steps.merge.outputs.conflict || '无' }}\` |"
+            echo "| DNS 修复完好 | \`${{ steps.verify.outputs.dns_ok || 'n/a' }}\` |"
+            echo "| 测试退出码 | \`${{ steps.test.outputs.test_exit || 'n/a' }}\` |"
+            echo "| dry run | \`${{ inputs.dry_run || 'false' }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

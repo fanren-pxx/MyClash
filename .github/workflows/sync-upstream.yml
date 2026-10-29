@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   sync:
-    name: Merge upstream/fake-upstream-ok
+    name: Merge upstream/main
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -54,14 +54,14 @@ jobs:
 
       - name: Add upstream remote
         run: |
-          git remote add upstream https://github.com/fanren-pxx/MyClash.git || \
-            git remote set-url upstream https://github.com/fanren-pxx/MyClash.git
+          git remote add upstream https://github.com/AIsouler/MyClash.git || \
+            git remote set-url upstream https://github.com/AIsouler/MyClash.git
 
       - name: Fetch upstream
         id: fetch
         run: |
-          git fetch upstream fake-upstream-ok --depth=50
-          UPSTREAM_SHA=$(git rev-parse upstream/fake-upstream-ok)
+          git fetch upstream main --depth=50
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
           HEAD_SHA=$(git rev-parse HEAD)
           echo "upstream=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
           echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
@@ -80,13 +80,13 @@ jobs:
         run: |
           set +e
           # 先尝试 fast-forward（你没有任何本地提交时走这条路，最干净）
-          git merge --ff-only upstream/fake-upstream-ok
+          git merge --ff-only upstream/main
           FF_EXIT=$?
           if [ "$FF_EXIT" -ne 0 ]; then
             echo "无法快进，改用普通合并（保留本地 DNS 修复提交）"
             git config user.name  "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git merge --no-edit upstream/fake-upstream-ok
+            git merge --no-edit upstream/main
             MERGE_EXIT=$?
             if [ "$MERGE_EXIT" -ne 0 ]; then
               echo "conflict=true" >> "$GITHUB_OUTPUT"
@@ -195,9 +195,9 @@ jobs:
             "" \
             '```bash' \
             "git pull" \
-            "git remote add upstream https://github.com/fanren-pxx/MyClash.git  # 如已有可跳过" \
+            "git remote add upstream https://github.com/AIsouler/MyClash.git  # 如已有可跳过" \
             "git fetch upstream" \
-            "git merge upstream/fake-upstream-ok" \
+            "git merge upstream/main" \
             "# 手动修正：defaultDNS / proxyServerDNS 必须保持 tls://IP#SNI 形式，不能出现 114 等明文 DNS" \
             "node Test/run-tests.js   # 211 项全绿再推" \
             "git push" \
@@ -237,9 +237,9 @@ jobs:
             "" \
             '```bash' \
             "git pull" \
-            "git remote add upstream https://github.com/fanren-pxx/MyClash.git  # 如已有可跳过" \
+            "git remote add upstream https://github.com/AIsouler/MyClash.git  # 如已有可跳过" \
             "git fetch upstream" \
-            "git merge upstream/fake-upstream-ok" \
+            "git merge upstream/main" \
             "# 解决冲突（通常在 Script/mihomoScript.js 的 defaultDNS / proxyServerDNS 两个常量）" \
             "# ⚠️ 解决时保留 DNS 修复：defaultDNS 必须仍是 tls://...#SNI 形式，不能回到 114" \
             "node Test/run-tests.js   # 211 项全绿再推" \
@@ -270,9 +270,9 @@ jobs:
             echo ""
             echo '```bash'
             echo "git pull"
-            echo "git remote add upstream https://github.com/fanren-pxx/MyClash.git"
+            echo "git remote add upstream https://github.com/AIsouler/MyClash.git"
             echo "git fetch upstream"
-            echo "git merge upstream/fake-upstream-ok"
+            echo "git merge upstream/main"
             echo "# 保留 DNS 修复后提交"
             echo "node Test/run-tests.js"
             echo "git push"

@@ -31,3 +31,5 @@ PROCESS-NAME,WebTorrentHelper
 PROCESS-NAME,WebTorrentHelper.exe
 PROCESS-NAME,Weiyun
 PROCESS-NAME,Weiyun.exe
+
+# fake-upstream test line
